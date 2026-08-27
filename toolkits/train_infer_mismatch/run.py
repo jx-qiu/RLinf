@@ -34,11 +34,13 @@ from rlinf.utils.nested_dict_process import clone_nested_to_cpu, put_tensor_devi
 from toolkits.train_infer_mismatch import TOOL_VERSION
 from toolkits.train_infer_mismatch.common import (
     apply_runtime_flags,
+    batch_slice,
     build_amp_context,
     build_model,
     get_fingerprint,
     hash_nested,
     hash_state_dict,
+    infer_batch_size,
     load_model_cfg,
 )
 
@@ -61,6 +63,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Load weights from --model-path even if the artifact bundles them.")
     p.add_argument("--compute-values", action="store_true",
                    help="Also run the value path (does not affect log-probs).")
+    p.add_argument("--micro-batch-size", type=int, default=8,
+                   help="Forward chunk size so large artifacts fit in GPU memory.")
     p.add_argument("--amp", choices=["config", "off", "bf16", "fp16", "fp32"],
                    default="config", help="Autocast override; 'config' follows the training config.")
     p.add_argument("--tf32", choices=["default", "on", "off"], default="default",
@@ -103,22 +107,32 @@ def main() -> None:
     model = build_model(model_cfg, device=args.device, weights_state_dict=weights)
 
     amp_ctx, amp_label = build_amp_context(amp_cfg, override=args.amp)
-    forward_inputs = put_tensor_device(artifact["forward_inputs"], args.device)
+    forward_inputs_cpu = artifact["forward_inputs"]
+    total_b = infer_batch_size(forward_inputs_cpu)
+    micro_bs = max(1, args.micro_batch_size)
 
-    print(f"[run] recomputing log-probs (amp={amp_label}, "
-          f"compute_values={args.compute_values})")
-    with torch.no_grad(), amp_ctx:
-        out = model(
-            forward_inputs=forward_inputs,
-            compute_logprobs=True,
-            compute_entropy=False,
-            compute_values=args.compute_values,
-            use_cache=False,
-        )
+    print(f"[run] recomputing log-probs: {total_b} inputs in chunks of {micro_bs} "
+          f"(amp={amp_label}, compute_values={args.compute_values})")
+    lp_list, val_list, ent_list = [], [], []
+    for s in range(0, total_b, micro_bs):
+        e = min(s + micro_bs, total_b)
+        fi = put_tensor_device(batch_slice(forward_inputs_cpu, s, e), args.device)
+        with torch.no_grad(), amp_ctx:
+            out = model(
+                forward_inputs=fi,
+                compute_logprobs=True,
+                compute_entropy=False,
+                compute_values=args.compute_values,
+                use_cache=False,
+            )
+        lp_list.append(out["logprobs"].detach().float().cpu())
+        v, ent = out.get("values"), out.get("entropy")
+        val_list.append(v.detach().float().cpu() if torch.is_tensor(v) else None)
+        ent_list.append(ent.detach().float().cpu() if torch.is_tensor(ent) else None)
 
-    logprobs = out["logprobs"].detach().float().cpu()
-    values = clone_nested_to_cpu(out.get("values"))
-    entropy = clone_nested_to_cpu(out.get("entropy"))
+    logprobs = torch.cat(lp_list, dim=0)
+    values = torch.cat(val_list, dim=0) if val_list and val_list[0] is not None else None
+    entropy = torch.cat(ent_list, dim=0) if ent_list and ent_list[0] is not None else None
     weight_hash = hash_state_dict(model.state_dict())
     degenerate = bool(torch.count_nonzero(logprobs) == 0)
 
@@ -133,6 +147,7 @@ def main() -> None:
         "fingerprint": get_fingerprint(str(logprobs.dtype), amp_label),
         "compute_values": args.compute_values,
         "noise_level": args.noise_level,
+        "micro_batch_size": micro_bs,
         "degenerate_logprobs": degenerate,
     }
     torch.save(result, args.output)

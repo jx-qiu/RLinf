@@ -38,23 +38,46 @@ instead of `--preset` (it reuses your exact `actor.model`).
 
 ```bash
 export OPENPI_VENV=/mnt/public/jxqiu/.venv-openpi
-CKPT=/path/to/RLinf-Pi05-LIBERO-SFT
+CKPT=/mnt/public/daibo/models/pi05_b1kpt50_pt
 
-# 1) On any machine: freeze one batch. --bundle-weights makes the artifact
-#    self-contained (~several GB) so a machine without the checkpoint can run it.
+# 1) On ONE machine: freeze the batch (do NOT dump separately per machine — see below).
+#    No --bundle-weights when the checkpoint is on shared storage: the artifact
+#    then holds only the frozen inputs (~90 MB for 128 inputs), easy to copy.
 bash toolkits/train_infer_mismatch/run.sh dump \
-    --preset pi05_libero --model-path "$CKPT" --bundle-weights \
-    --batch-size 8 --seed 0 -o artifact.pt
+    --preset pi05_behavior --model-path "$CKPT" \
+    --batch-size 128 --micro-batch-size 8 --seed 0 -o artifact.pt
 
 # 2) On the 4090, then copy artifact.pt to the A100 box and run there too.
+#    Keep --micro-batch-size identical on both machines.
 bash toolkits/train_infer_mismatch/run.sh run \
-    --preset pi05_libero --model-path "$CKPT" --artifact artifact.pt -o out_4090.pt
+    --preset pi05_behavior --model-path "$CKPT" --artifact artifact.pt \
+    --micro-batch-size 8 -o out_4090.pt
 bash toolkits/train_infer_mismatch/run.sh run \
-    --preset pi05_libero --model-path "$CKPT" --artifact artifact.pt -o out_a100.pt
+    --preset pi05_behavior --model-path "$CKPT" --artifact artifact.pt \
+    --micro-batch-size 8 -o out_a100.pt
 
 # 3) Anywhere: compare.
 bash toolkits/train_infer_mismatch/run.sh compare out_4090.pt out_a100.pt --json report.json
 ```
+
+## Build the artifact ONCE — never per machine
+
+`dump` *samples* the flow-SDE noise (`chains`) stochastically on the GPU, so two
+independent dumps produce **different** frozen inputs. Comparing them would mix
+the noise difference with the hardware difference (and `compare` aborts on the
+`input_hash` mismatch anyway). Always `dump` once and share `artifact.pt`.
+
+The artifact is only large when you pass `--bundle-weights` (it embeds the ~7 GB
+checkpoint). If the checkpoint path is reachable on both machines (e.g. shared
+`/mnt/public`), **omit `--bundle-weights`**: the artifact then carries just the
+frozen inputs — ~90 MB for 128 inputs (dominated by the 224×224 images) — and
+both machines load the weights from `--model-path`. Use `--bundle-weights` only
+when the checkpoint is *not* available on the second machine.
+
+`--batch-size` sets how many frozen inputs to carry; `--micro-batch-size` chunks
+the forward so large batches fit on a 24 GB 4090. The number of log-prob samples
+the stats are computed over is `batch_size × num_chunks × action_dim`
+(e.g. 128 × 32 × 23 ≈ 94 k).
 
 ## Deterministic policies (`noise_level = 0`)
 

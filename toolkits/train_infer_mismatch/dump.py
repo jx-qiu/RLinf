@@ -34,11 +34,14 @@ from omegaconf import OmegaConf
 from rlinf.utils.nested_dict_process import clone_nested_to_cpu
 from toolkits.train_infer_mismatch import TOOL_VERSION
 from toolkits.train_infer_mismatch.common import (
+    batch_concat,
+    batch_slice,
     build_model,
     get_effective_noise_level,
     get_fingerprint,
     hash_nested,
     hash_state_dict,
+    infer_batch_size,
     load_model_cfg,
     make_synthetic_env_obs,
     resolve_obs_params,
@@ -62,7 +65,10 @@ def _parse_args() -> argparse.Namespace:
                         "reproduce a deterministic (noise_level=0) policy. run inherits "
                         "whatever value is recorded in the artifact.")
     # Synthetic observation controls (only used at dump time).
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="Number of frozen inputs to carry in the artifact.")
+    p.add_argument("--micro-batch-size", type=int, default=8,
+                   help="Forward chunk size so large --batch-size fits in GPU memory.")
     p.add_argument("--state-dim", type=int, default=None)
     p.add_argument("--image-hw", type=int, default=None)
     p.add_argument("--num-images", type=int, default=None)
@@ -95,12 +101,24 @@ def main() -> None:
         print(f"[dump] synthesizing env_obs {obs_params}")
         env_obs = make_synthetic_env_obs(**obs_params)
 
-    with torch.no_grad():
-        actions, result = model.predict_action_batch(env_obs, mode=args.mode)
+    total_b = infer_batch_size(env_obs)
+    micro_bs = max(1, args.micro_batch_size)
+    print(f"[dump] rollout: {total_b} inputs in chunks of {micro_bs}")
+    fi_list, lp_list, val_list, act_list = [], [], [], []
+    for s in range(0, total_b, micro_bs):
+        e = min(s + micro_bs, total_b)
+        chunk = batch_slice(env_obs, s, e)
+        with torch.no_grad():
+            act, res = model.predict_action_batch(chunk, mode=args.mode)
+        fi_list.append(clone_nested_to_cpu(res["forward_inputs"]))
+        lp_list.append(clone_nested_to_cpu(res.get("prev_logprobs")))
+        val_list.append(clone_nested_to_cpu(res.get("prev_values")))
+        act_list.append(clone_nested_to_cpu(act))
 
-    forward_inputs = clone_nested_to_cpu(result["forward_inputs"])
-    prev_logprobs = clone_nested_to_cpu(result.get("prev_logprobs"))
-    prev_values = clone_nested_to_cpu(result.get("prev_values"))
+    forward_inputs = batch_concat(fi_list)
+    prev_logprobs = batch_concat(lp_list)
+    prev_values = batch_concat(val_list)
+    actions = batch_concat(act_list)
     input_hash = hash_nested(forward_inputs)
     noise_level = get_effective_noise_level(model_cfg)
     degenerate = bool(
@@ -112,7 +130,7 @@ def main() -> None:
         "forward_inputs": forward_inputs,
         "prev_logprobs": prev_logprobs,
         "prev_values": prev_values,
-        "actions": clone_nested_to_cpu(actions),
+        "actions": actions,
         "input_hash": input_hash,
         "meta": {
             "model_cfg": OmegaConf.to_container(model_cfg, resolve=True),
@@ -121,6 +139,7 @@ def main() -> None:
             else None,
             "obs_params": None if args.real_obs else obs_params,
             "mode": args.mode,
+            "batch_size": total_b,
             "noise_level": noise_level,
             "degenerate_logprobs": degenerate,
             "dump_fingerprint": get_fingerprint("dump", "n/a"),

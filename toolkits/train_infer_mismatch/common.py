@@ -277,6 +277,51 @@ def make_synthetic_env_obs(
 
 
 # ---------------------------------------------------------------------------
+# Batch chunking (so large --batch-size fits in GPU memory)
+# ---------------------------------------------------------------------------
+def infer_batch_size(nested: dict) -> int:
+    """Infer the leading batch dim from an env_obs or forward_inputs dict."""
+    for key in ("main_images", "chains", "observation/image", "tokenized_prompt"):
+        v = nested.get(key)
+        if isinstance(v, (torch.Tensor, np.ndarray)):
+            return int(v.shape[0])
+    td = nested.get("task_descriptions")
+    if isinstance(td, list):
+        return len(td)
+    raise ValueError("could not infer batch size from nested dict")
+
+
+def batch_slice(obj: Any, start: int, end: int) -> Any:
+    """Slice the leading (batch) dim of tensors/arrays/lists in a nested obj."""
+    if obj is None:
+        return None
+    if isinstance(obj, (torch.Tensor, np.ndarray, list)):
+        return obj[start:end]
+    if isinstance(obj, dict):
+        return {k: batch_slice(v, start, end) for k, v in obj.items()}
+    return obj  # scalars/strings are shared across the batch
+
+
+def batch_concat(objs: list) -> Any:
+    """Concatenate a list of same-structure nested objs along the batch dim."""
+    first = objs[0]
+    if first is None:
+        return None
+    if isinstance(first, torch.Tensor):
+        return torch.cat(list(objs), dim=0)
+    if isinstance(first, np.ndarray):
+        return np.concatenate(list(objs), axis=0)
+    if isinstance(first, list):
+        out: list = []
+        for o in objs:
+            out.extend(o)
+        return out
+    if isinstance(first, dict):
+        return {k: batch_concat([o[k] for o in objs]) for k in first}
+    return first
+
+
+# ---------------------------------------------------------------------------
 # AMP context (mirror the actor's ``self.amp_context``)
 # ---------------------------------------------------------------------------
 _AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
